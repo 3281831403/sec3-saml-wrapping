@@ -1,0 +1,9 @@
+[project]
+name = "sec3-saml-wrapping"
+version = "0.1.0"
+description = "SAML assertion wrapping checks with a small signed-document format"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
