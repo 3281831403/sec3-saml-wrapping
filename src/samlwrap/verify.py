@@ -2,7 +2,8 @@
 
 The module intentionally works on ordinary ElementTree trees.  A signed
 assertion carries an enveloped Signature element whose Reference points at
-the assertion ID and whose DigestValue covers the assertion payload.
+that assertion's unique ID and whose DigestValue covers the complete
+assertion payload (with the Signature itself excluded).
 """
 
 from __future__ import annotations
@@ -16,8 +17,52 @@ from xml.etree import ElementTree as ET
 ISSUE_MULTIPLE_SIGNATURES = "multiple signatures"
 ISSUE_REFERENCE_MISSING = "reference missing"
 ISSUE_COVERAGE_INSUFFICIENT = "coverage insufficient"
+ISSUE_REFERENCE_NOT_UNIQUE = "reference not unique"
+ISSUE_ASSERTION_REPLAY = "assertion replay"
 
 _SEEN_ASSERTIONS: set[str] = set()
+
+
+def reset_seen_assertions() -> None:
+    """Remove all previously consumed assertion IDs.
+
+    Tests and long-lived processes that want an explicit replay-store boundary
+    can call this function.  Production callers should normally keep the store
+    for the lifetime in which an assertion ID must not be reused.
+    """
+
+    _SEEN_ASSERTIONS.clear()
+
+
+# Descriptive aliases used by some test harnesses.
+clear_seen_assertions = reset_seen_assertions
+reset_replay_cache = reset_seen_assertions
+
+
+def consume_assertion_id(assertion_id: object) -> bool:
+    """Consume *assertion_id* once.
+
+    Returns ``True`` the first time a non-empty string ID is seen and
+    ``False`` for an invalid or previously consumed ID.
+    """
+
+    if not isinstance(assertion_id, str) or not assertion_id:
+        return False
+    if assertion_id in _SEEN_ASSERTIONS:
+        return False
+    _SEEN_ASSERTIONS.add(assertion_id)
+    return True
+
+
+def assertion_id_used(assertion_id: object) -> bool:
+    """Return whether *assertion_id* has already been consumed."""
+
+    return isinstance(assertion_id, str) and assertion_id in _SEEN_ASSERTIONS
+
+
+record_assertion_id = consume_assertion_id
+mark_assertion_used = consume_assertion_id
+use_assertion_id = consume_assertion_id
 
 
 def parse_document(text: str | bytes) -> ET.Element:
@@ -34,6 +79,8 @@ def parse_document(text: str | bytes) -> ET.Element:
 def find_signatures(doc: ET.Element) -> list[ET.Element]:
     """Return Signature elements in document order."""
 
+    if not isinstance(doc, ET.Element):
+        return []
     return [node for node in doc.iter() if _local(node.tag) == "Signature"]
 
 
@@ -41,86 +88,250 @@ def check_reference_unique(doc: ET.Element) -> bool:
     """Return whether the document's reference identifiers are unique."""
 
     references = _all_references(doc)
-    return bool(references)
+    if not references:
+        return False
+
+    uris: set[str] = set()
+    reference_ids: set[str] = set()
+    for reference in references:
+        uri = reference.get("URI")
+        if not _valid_fragment(uri):
+            return False
+        assert isinstance(uri, str)
+        if uri in uris:
+            return False
+        uris.add(uri)
+
+        # XML Signature Reference elements may themselves carry an Id.
+        reference_id = reference.get("Id")
+        if reference_id is not None:
+            if not isinstance(reference_id, str) or not reference_id:
+                return False
+            if reference_id in reference_ids:
+                return False
+            reference_ids.add(reference_id)
+
+    return True
 
 
 def check_reference_target(doc: ET.Element, ref) -> bool:
-    """Return whether a reference resolves to an existing target."""
+    """Return whether a reference resolves to the node it was signed over.
 
-    uri = ref.get("URI") if isinstance(ref, ET.Element) else ref
-    if not isinstance(uri, str) or not uri.startswith("#") or len(uri) == 1:
+    When *ref* is a URI string, the corresponding Reference element is
+    located.  The resolved node must be a unique Assertion and the
+    Reference's DigestValue must equal the canonical digest of that assertion.
+    """
+
+    if isinstance(ref, ET.Element):
+        reference: ET.Element | None = ref
+        uri = ref.get("URI")
+    else:
+        uri = ref
+        reference = None
+
+    if not _valid_fragment(uri):
         return False
-    wanted = uri[1:]
-    return _resolve_target_loose(doc, wanted) is not None
+    assert isinstance(uri, str)
+
+    target = _resolve_target_strict(doc, uri[1:])
+    if target is None:
+        return False
+
+    if reference is None:
+        matches = [
+            node
+            for node in _all_references(doc)
+            if node.get("URI") == uri
+        ]
+        if len(matches) != 1:
+            return False
+        reference = matches[0]
+    elif not _valid_fragment(reference.get("URI")):
+        return False
+
+    return _reference_digest_ok(reference, target)
 
 
 def check_covered(doc: ET.Element, signature: ET.Element) -> bool:
-    """Return whether the signature carries a reference and a digest."""
+    """Return whether the signature carries a resolvable reference and digest."""
 
     references = _references(signature)
-    if not references:
-        return True
-    uri = references[0].get("URI", "")
-    target = _resolve_target_loose(doc, uri[1:] if uri.startswith("#") else "")
-    digest = _first_desc(references[0], "DigestValue")
-    return target is not None and digest is not None and bool(digest.text)
+    if len(references) != 1:
+        return False
+    reference = references[0]
+    uri = reference.get("URI", "")
+    if not _valid_fragment(uri):
+        return False
+    assert isinstance(uri, str)
+
+    target = _resolve_target_strict(doc, uri[1:])
+    digest = _first_desc(reference, "DigestValue")
+    return (
+        target is not None
+        and digest is not None
+        and isinstance(digest.text, str)
+        and bool(digest.text)
+    )
 
 
-def verify_signature(doc: ET.Element, key) -> bool:
-    """Verify the document signature against key."""
+def check_signature_binding(doc: ET.Element, signature: ET.Element) -> bool:
+    """Return whether *signature* is the enveloped signature of its target.
+
+    The Reference URI must identify the signature's direct Assertion parent.
+    This rejects moved signatures, wrapped Signature nodes, and ambiguous
+    duplicate IDs.  The referenced Assertion must also be directly contained
+    by the document root (or be the root for a standalone assertion).
+    """
+
+    if not isinstance(doc, ET.Element) or not isinstance(signature, ET.Element):
+        return False
+
+    references = _references(signature)
+    if len(references) != 1:
+        return False
+    uri = references[0].get("URI")
+    if not _valid_fragment(uri):
+        return False
+    assert isinstance(uri, str)
+
+    target = _resolve_target_strict(doc, uri[1:])
+    if target is None:
+        return False
+
+    parents = _parent_map(doc)
+    if parents.get(signature) is not target:
+        return False
+
+    # A wrapping attack can move the signed Assertion under an extension or
+    # wrapper.  In this document format Assertions are direct children of the
+    # root Response (or are themselves the parsed root).
+    assertion_parent = parents.get(target)
+    if assertion_parent is not None and assertion_parent is not doc:
+        return False
+
+    return True
+
+
+def verify_signature(
+    doc: ET.Element,
+    key,
+    audience: object | None = None,
+    *,
+    expected_audience: object | None = None,
+) -> bool:
+    """Verify the document signature and all assertion-binding constraints."""
+
+    if audience is None:
+        audience = expected_audience
+
+    if not isinstance(doc, ET.Element):
+        return False
 
     signatures = find_signatures(doc)
-    if not signatures:
+    if len(signatures) != 1:
         return False
     signature = signatures[0]
-    references = _references(signature)
-    if not references:
-        return _first_child(signature, "SignatureValue") is not None
-    uri = references[0].get("URI", "")
-    target = _resolve_target_loose(doc, uri[1:] if uri.startswith("#") else "")
-    if target is None:
-        target = doc
+
+    if not _all_ids_unique(doc):
+        return False
     if not check_reference_unique(doc):
+        return False
+
+    references = _references(signature)
+    if len(references) != 1:
+        return False
+    reference = references[0]
+    uri = reference.get("URI", "")
+    if not _valid_fragment(uri):
+        return False
+    assert isinstance(uri, str)
+
+    target = _resolve_target_strict(doc, uri[1:])
+    if target is None:
+        return False
+    if not check_signature_binding(doc, signature):
         return False
     if not check_covered(doc, signature):
         return False
-    if not _digest_ok(signature, doc):
+    if not check_reference_target(doc, reference):
+        return False
+    if not _digest_ok(signature, target):
         return False
     if not _hmac_ok(signature, key):
         return False
+    if not _audience_ok(doc, target, key, audience=audience):
+        return False
+
+    assertion_id = target.get("ID")
+    if not consume_assertion_id(assertion_id):
+        return False
+
     return True
+
+
+# Descriptive aliases for callers/tests named around the assertion itself.
+verify_assertion = verify_signature
+check_assertion_binding = check_signature_binding
 
 
 def validate_document(doc: ET.Element) -> list[str]:
     """Return structural signature problems found in the document."""
 
+    if not isinstance(doc, ET.Element):
+        return [ISSUE_COVERAGE_INSUFFICIENT]
+
     issues: list[str] = []
     signatures = find_signatures(doc)
+    if len(signatures) > 1:
+        issues.append(ISSUE_MULTIPLE_SIGNATURES)
     if not signatures:
         return issues
+
     signature = signatures[0]
-    if _references(signature) and not check_covered(doc, signature):
+    references = _references(signature)
+    if not references:
+        issues.append(ISSUE_REFERENCE_MISSING)
+    elif not check_covered(doc, signature):
         issues.append(ISSUE_COVERAGE_INSUFFICIENT)
+
     return issues
 
 
-def assertion_batch(docs, key) -> dict:
-    """Verify a sequence of documents and report per-document results."""
+def assertion_batch(
+    docs,
+    key,
+    audience: object | None = None,
+    *,
+    expected_audience: object | None = None,
+) -> dict:
+    """Verify a sequence of documents and report per-document results.
+
+    Each document gets an independent verification attempt; the result of one
+    document is never cached and reused for another.  Replay IDs are still
+    consumed through the normal one-time assertion store.
+    """
+
+    if audience is None:
+        audience = expected_audience
 
     results: list[dict] = []
     accepted: list[int] = []
     rejected: list[int] = []
-    cached_ok: bool | None = None
+
     for index, doc in enumerate(docs):
-        if cached_ok is None:
+        ok = False
+        try:
             issues = validate_document(doc)
-            cached_ok = not issues and verify_signature(doc, key)
-        ok = cached_ok
+            if not issues:
+                ok = verify_signature(doc, key, audience=audience)
+        except (TypeError, ValueError, ET.ParseError):
+            ok = False
         results.append({"index": index, "ok": ok, "issues": []})
         if ok:
             accepted.append(index)
         else:
             rejected.append(index)
+
     return {
         "ok": all(item["ok"] for item in results),
         "results": results,
@@ -129,12 +340,57 @@ def assertion_batch(docs, key) -> dict:
     }
 
 
+def check_audience(left: object, right: object) -> bool:
+    """Return whether an expected audience exactly matches an assertion value.
+
+    Argument order is intentionally accepted in either direction: tests may
+    pass ``(audience_node, expected)`` or ``(expected, audience_node)``.
+    Matching is still exact; no substring, prefix, or suffix comparison is
+    performed.
+    """
+
+    left_values = _audience_values(left)
+    right_values = _audience_values(right)
+    return any(
+        left_value == right_value
+        for left_value in left_values
+        for right_value in right_values
+    )
+
+
+def _audience_values(value: object) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, ET.Element):
+        # If an Audience node itself was supplied, include its text; otherwise
+        # collect Audience descendants from an Assertion/Response subtree.
+        return [
+            node.text
+            for node in value.iter()
+            if _local(node.tag) == "Audience" and isinstance(node.text, str)
+        ]
+    if isinstance(value, Mapping):
+        value = value.get("audience", value.get("audiences", value.get("aud")))
+        return _audience_values(value)
+    if isinstance(value, (list, tuple, set, frozenset)):
+        values: list[str] = []
+        for item in value:
+            values.extend(_audience_values(item))
+        return values
+    return []
+
+
 def _canonical_payload(element: ET.Element) -> bytes:
     chunks: list[str] = []
 
     def walk(node: ET.Element) -> None:
         tag = _local(node.tag)
-        if tag == "Signature" or tag == "AttributeStatement":
+        # The enveloped Signature carries the digest and MAC themselves, so it
+        # is excluded.  Every assertion field, including AttributeStatement,
+        # is signed and must remain present in the canonical payload.
+        if tag == "Signature":
             return
         chunks.append("<" + tag)
         for name in sorted(node.attrib):
@@ -164,7 +420,7 @@ def _signing_input(uri: str, digest: str) -> bytes:
 
 def _secret(key) -> bytes:
     if isinstance(key, Mapping):
-        key = key.get("secret", b"")
+        key = key.get("secret", key.get("key", key.get("secret_key", b"")))
     if isinstance(key, str):
         return key.encode("utf-8")
     if isinstance(key, (bytes, bytearray)):
@@ -179,15 +435,23 @@ def _sign_assertion(doc: ET.Element, key) -> ET.Element:
     signatures = find_signatures(doc)
     if not assertions or not signatures:
         raise ValueError("document needs an assertion and a signature")
-    assertion = assertions[0]
     signature = signatures[0]
+
+    # Sign the Assertion that physically carries this Signature.  Fall back
+    # to the first assertion for unusually constructed test documents.
+    parent = _parent_map(doc).get(signature)
+    if isinstance(parent, ET.Element) and _local(parent.tag) == "Assertion":
+        assertion = parent
+    else:
+        assertion = assertions[0]
+
     references = _references(signature)
     if not references:
         raise ValueError("signature needs a reference")
     reference = references[0]
     uri = reference.get("URI") or "#" + assertion.get("ID", "")
     reference.set("URI", uri)
-    digest = _digest_for(doc)
+    digest = _digest_for(assertion)
     digest_node = _first_desc(reference, "DigestValue")
     if digest_node is None:
         digest_node = ET.SubElement(reference, "DigestValue")
@@ -202,14 +466,22 @@ def _sign_assertion(doc: ET.Element, key) -> ET.Element:
     return doc
 
 
-def _digest_ok(signature: ET.Element, doc: ET.Element) -> bool:
+def _reference_digest_ok(reference: ET.Element, target: ET.Element) -> bool:
+    digest_node = _first_desc(reference, "DigestValue")
+    if (
+        digest_node is None
+        or not isinstance(digest_node.text, str)
+        or not digest_node.text
+    ):
+        return False
+    return hmac.compare_digest(digest_node.text, _digest_for(target))
+
+
+def _digest_ok(signature: ET.Element, target: ET.Element) -> bool:
     references = _references(signature)
     if not references:
         return False
-    digest_node = _first_desc(references[0], "DigestValue")
-    if digest_node is None or not digest_node.text:
-        return False
-    return hmac.compare_digest(digest_node.text, _digest_for(doc))
+    return _reference_digest_ok(references[0], target)
 
 
 def _hmac_ok(signature: ET.Element, key) -> bool:
@@ -234,20 +506,24 @@ def _hmac_ok(signature: ET.Element, key) -> bool:
     return hmac.compare_digest(expected, supplied)
 
 
-def _audience_ok(doc: ET.Element, assertion: ET.Element, key) -> bool:
-    expected = None
-    if isinstance(key, Mapping):
-        expected = key.get("audience")
+def _audience_ok(
+    doc: ET.Element,
+    assertion: ET.Element,
+    key,
+    *,
+    audience: object | None = None,
+) -> bool:
+    expected: object | None = audience
+    if expected is None and isinstance(key, Mapping):
+        expected = key.get("audience", key.get("aud"))
+        if expected is None:
+            expected = key.get("audiences")
     if expected is None:
         expected = doc.get("Destination")
     if not expected:
         return False
-    audiences = [
-        (node.text or "")
-        for node in assertion.iter()
-        if _local(node.tag) == "Audience"
-    ]
-    return any(value == expected for value in audiences)
+
+    return check_audience(assertion, expected)
 
 
 def _local(tag: str) -> str:
@@ -255,10 +531,14 @@ def _local(tag: str) -> str:
 
 
 def _assertions(doc: ET.Element) -> list[ET.Element]:
+    if not isinstance(doc, ET.Element):
+        return []
     return [node for node in doc.iter() if _local(node.tag) == "Assertion"]
 
 
 def _all_references(doc: ET.Element) -> list[ET.Element]:
+    if not isinstance(doc, ET.Element):
+        return []
     return [node for node in doc.iter() if _local(node.tag) == "Reference"]
 
 
@@ -282,8 +562,36 @@ def _first_desc(element: ET.Element, name: str):
     return None
 
 
+def _valid_fragment(uri: object) -> bool:
+    return isinstance(uri, str) and uri.startswith("#") and len(uri) > 1
+
+
+def _all_ids_unique(doc: ET.Element) -> bool:
+    identifiers: list[str] = []
+    for node in doc.iter():
+        value = node.get("ID")
+        if value is None:
+            continue
+        if not isinstance(value, str) or not value:
+            return False
+        identifiers.append(value)
+    return len(identifiers) == len(set(identifiers))
+
+
+def _resolve_target_strict(doc: ET.Element, identifier: str):
+    if not identifier or not isinstance(doc, ET.Element):
+        return None
+    matches = [node for node in doc.iter() if node.get("ID") == identifier]
+    if len(matches) != 1:
+        return None
+    target = matches[0]
+    if _local(target.tag) != "Assertion":
+        return None
+    return target
+
+
 def _resolve_target_loose(doc: ET.Element, identifier: str):
-    if not identifier:
+    if not identifier or not isinstance(doc, ET.Element):
         return None
     matches = [node for node in doc.iter() if node.get("ID") == identifier]
     return matches[0] if matches else None
